@@ -15,6 +15,8 @@ Usage:
 
 import sys
 import time
+import os
+import json
 from datetime import datetime, timezone, timedelta
 from news_analyzer import get_team_sentiment
 
@@ -30,6 +32,39 @@ WAT_OFFSET = timezone(timedelta(hours=1))
 # Track fixture IDs already sent today — reset at midnight WAT
 _sent_fixture_ids = set()
 _sent_date        = None
+
+STATE_DIR = ".state"
+
+
+def _state_path(sport: str, day) -> str:
+    safe_sport = "".join(c for c in (sport or "sport") if c.isalnum() or c in ("-", "_")).lower()
+    return os.path.join(STATE_DIR, f"sent_{safe_sport}_{day}.json")
+
+
+def _load_sent_ids(sport: str, day) -> set:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        path = _state_path(sport, day)
+        if not os.path.exists(path):
+            return set()
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return set(str(x) for x in data)
+    except Exception:
+        pass
+    return set()
+
+
+def _save_sent_ids(sport: str, day, ids_set: set) -> None:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        path = _state_path(sport, day)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(sorted(list(set(str(x) for x in ids_set))), f)
+    except Exception:
+        # Best-effort; don't crash the scheduler if state can't be written.
+        pass
 
 
 def run_football():
@@ -53,7 +88,7 @@ def run_football():
 
     # Reset sent tracker at the start of each new WAT day
     if _sent_date != today:
-        _sent_fixture_ids = set()
+        _sent_fixture_ids = _load_sent_ids("football", today)
         _sent_date = today
 
     fixtures = fetch_football_fixtures()
@@ -89,6 +124,7 @@ def run_football():
         for fix, pred in results:
             sender.send_message(format_football_card(fix, pred), parse_mode="Markdown")
             _sent_fixture_ids.add(fix["fixture_id"])  # mark as sent
+        _save_sent_ids("football", today, _sent_fixture_ids)
     elif not fixtures:
         pass  # silent — no need to spam "no matches" every 2 hours
     print(f"[FOOTBALL] {len(results)} new predictions sent, {len(skipped)} skipped, "
@@ -113,9 +149,16 @@ def run_nba():
     # Load team stats ONCE before the loop
     _ensure_nba_stats_loaded()
 
+    now_wat = datetime.now(WAT_OFFSET)
+    today = now_wat.date()
+    sent_ids = _load_sent_ids("nba", today)
+
     fixtures = fetch_nba_fixtures()
     results  = []
     for fix in fixtures:
+        fid = str(fix.get("fixture_id") or "")
+        if fid and fid in sent_ids:
+            continue
         wp  = fix.pop("win_prob", None)
         hs  = fetch_nba_team_season_stats(fix.get("home_id"), team_name=fix.get("home_team", ""))
         aws = fetch_nba_team_season_stats(fix.get("away_id"), team_name=fix.get("away_team", ""))
@@ -132,6 +175,9 @@ def run_nba():
         sender.send_message(format_sport_summary("🏀", "NBA BASKETBALL", results, date_str), parse_mode="Markdown")
         for fix, pred in results:
             sender.send_message(format_basketball_card(fix, pred), parse_mode="Markdown")
+            if fix.get("fixture_id") is not None:
+                sent_ids.add(str(fix["fixture_id"]))
+        _save_sent_ids("nba", today, sent_ids)
     else:
         sender.send_message("🏀 No qualifying NBA predictions today.", parse_mode="Markdown")
     print(f"[NBA] {len(results)} sent (LOW confidence filtered out).")
@@ -152,9 +198,16 @@ def run_tennis():
     t_pred   = TennisPredictor()
     date_str = datetime.now(WAT_OFFSET).strftime("%A, %d %B %Y")
 
+    now_wat = datetime.now(WAT_OFFSET)
+    today = now_wat.date()
+    sent_ids = _load_sent_ids("tennis", today)
+
     fixtures = fetch_tennis_fixtures()
     results  = []
     for fix in fixtures:
+        fid = str(fix.get("fixture_id") or "")
+        if fid and fid in sent_ids:
+            continue
         surface    = t_pred._detect_surface(fix.get("tournament", ""))
         home_stats = fetch_tennis_player_stats(
             fix.get("home_player_key", ""), surface,
@@ -177,6 +230,9 @@ def run_tennis():
         sender.send_message(format_sport_summary("🎾", "TENNIS", results, date_str), parse_mode="Markdown")
         for fix, pred in results:
             sender.send_message(format_tennis_card(fix, pred), parse_mode="Markdown")
+            if fix.get("fixture_id") is not None:
+                sent_ids.add(str(fix["fixture_id"]))
+        _save_sent_ids("tennis", today, sent_ids)
     else:
         sender.send_message("🎾 No qualifying tennis predictions today.", parse_mode="Markdown")
     print(f"[TENNIS] {len(results)} sent (LOW confidence filtered out).")
