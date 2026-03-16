@@ -67,7 +67,19 @@ def _save_sent_ids(sport: str, day, ids_set: set) -> None:
         pass
 
 
-def run_football():
+def _default_dedupe_mode() -> bool:
+    """
+    Default behavior:
+    - On GitHub Actions: dedupe on (prevents repeated sends every cron run)
+    - Locally: if user runs `--now`, default to resend (dedupe off) unless overridden
+    """
+    try:
+        return str(os.getenv("GITHUB_ACTIONS", "")).strip().lower() in ("1", "true", "yes")
+    except Exception:
+        return False
+
+
+def run_football(dedupe: bool = True):
     global _sent_fixture_ids, _sent_date
 
     from multi_sport_bot import (
@@ -88,7 +100,7 @@ def run_football():
 
     # Reset sent tracker at the start of each new WAT day
     if _sent_date != today:
-        _sent_fixture_ids = _load_sent_ids("football", today)
+        _sent_fixture_ids = _load_sent_ids("football", today) if dedupe else set()
         _sent_date = today
 
     fixtures = fetch_football_fixtures()
@@ -124,14 +136,15 @@ def run_football():
         for fix, pred in results:
             sender.send_message(format_football_card(fix, pred), parse_mode="Markdown")
             _sent_fixture_ids.add(fix["fixture_id"])  # mark as sent
-        _save_sent_ids("football", today, _sent_fixture_ids)
+        if dedupe:
+            _save_sent_ids("football", today, _sent_fixture_ids)
     elif not fixtures:
         pass  # silent — no need to spam "no matches" every 2 hours
     print(f"[FOOTBALL] {len(results)} new predictions sent, {len(skipped)} skipped, "
           f"{len(_sent_fixture_ids)} total sent today.")
 
 
-def run_nba():
+def run_nba(dedupe: bool = True):
     from multi_sport_bot import (
         validate_config, fetch_nba_fixtures,
         fetch_nba_team_season_stats, _ensure_nba_stats_loaded,
@@ -151,7 +164,7 @@ def run_nba():
 
     now_wat = datetime.now(WAT_OFFSET)
     today = now_wat.date()
-    sent_ids = _load_sent_ids("nba", today)
+    sent_ids = _load_sent_ids("nba", today) if dedupe else set()
 
     fixtures = fetch_nba_fixtures()
     results  = []
@@ -177,13 +190,14 @@ def run_nba():
             sender.send_message(format_basketball_card(fix, pred), parse_mode="Markdown")
             if fix.get("fixture_id") is not None:
                 sent_ids.add(str(fix["fixture_id"]))
-        _save_sent_ids("nba", today, sent_ids)
+        if dedupe:
+            _save_sent_ids("nba", today, sent_ids)
     else:
         sender.send_message("🏀 No qualifying NBA predictions today.", parse_mode="Markdown")
     print(f"[NBA] {len(results)} sent (LOW confidence filtered out).")
 
 
-def run_tennis():
+def run_tennis(dedupe: bool = True):
     from multi_sport_bot import (
         validate_config, fetch_tennis_fixtures,
         fetch_tennis_player_stats,
@@ -200,7 +214,7 @@ def run_tennis():
 
     now_wat = datetime.now(WAT_OFFSET)
     today = now_wat.date()
-    sent_ids = _load_sent_ids("tennis", today)
+    sent_ids = _load_sent_ids("tennis", today) if dedupe else set()
 
     fixtures = fetch_tennis_fixtures()
     results  = []
@@ -232,7 +246,8 @@ def run_tennis():
             sender.send_message(format_tennis_card(fix, pred), parse_mode="Markdown")
             if fix.get("fixture_id") is not None:
                 sent_ids.add(str(fix["fixture_id"]))
-        _save_sent_ids("tennis", today, sent_ids)
+        if dedupe:
+            _save_sent_ids("tennis", today, sent_ids)
     else:
         sender.send_message("🎾 No qualifying tennis predictions today.", parse_mode="Markdown")
     print(f"[TENNIS] {len(results)} sent (LOW confidence filtered out).")
@@ -250,12 +265,33 @@ def main():
         idx   = sys.argv.index("--sport")
         sport = sys.argv[idx + 1].lower() if idx + 1 < len(sys.argv) else None
 
-    run_fn = {"football": run_football, "nba": run_nba, "tennis": run_tennis}.get(sport, run_all)
+    # Dedupe flags
+    dedupe = _default_dedupe_mode()
+    if "--dedupe" in sys.argv:
+        dedupe = True
+    if "--resend" in sys.argv or "--no-dedupe" in sys.argv:
+        dedupe = False
+
+    def _run():
+        if sport == "football":
+            return run_football(dedupe=dedupe)
+        if sport == "nba":
+            return run_nba(dedupe=dedupe)
+        if sport == "tennis":
+            return run_tennis(dedupe=dedupe)
+        # all sports
+        return (run_football(dedupe=dedupe), run_nba(dedupe=dedupe), run_tennis(dedupe=dedupe))
+
+    run_fn = _run
+
     label  = sport.upper() if sport else "ALL SPORTS"
 
     if "--now" in sys.argv:
         print(f"[SCHEDULER] Running {label} immediately...")
-        run_fn()
+        # Local manual runs: default to resend everything unless the user asked for dedupe.
+        if str(os.getenv("GITHUB_ACTIONS", "")).strip().lower() not in ("1", "true", "yes") and "--dedupe" not in sys.argv and "--resend" not in sys.argv and "--no-dedupe" not in sys.argv:
+            dedupe = False
+        _run()
         return
 
     try:
