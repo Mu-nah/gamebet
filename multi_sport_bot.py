@@ -76,13 +76,46 @@ TENNIS_KEYS = [
     ).split(",") if k.strip()
 ]
 
-# ─── ROTATING CLIENTS ─────────────────────────────────────────────────────────
-football_client = RotatingClient(FOOTBALL_KEYS,   header_name="x-apisports-key")
-football_data_client = RotatingClient(FOOTBALL_DATA_KEYS, header_name="X-Auth-Token") if FOOTBALL_DATA_KEYS else None
-nba_client      = RotatingClient(BALLDONTLIE_KEYS, header_name="Authorization", bearer=True)
+# ─── ROTATING CLIENTS (LAZY) ──────────────────────────────────────────────────
+# Important for GitHub Actions: jobs may run a single sport without other API keys.
+# So we must not require unrelated keys just by importing this module.
+football_client = None
+football_data_client = None
+nba_client = None
+
+
+def _get_football_client():
+    global football_client
+    if football_client is not None:
+        return football_client
+    if not FOOTBALL_KEYS:
+        return None
+    football_client = RotatingClient(FOOTBALL_KEYS, header_name="x-apisports-key")
+    return football_client
+
+
+def _get_football_data_client():
+    global football_data_client
+    if football_data_client is not None:
+        return football_data_client
+    if not FOOTBALL_DATA_KEYS:
+        return None
+    football_data_client = RotatingClient(FOOTBALL_DATA_KEYS, header_name="X-Auth-Token")
+    return football_data_client
+
+
+def _get_nba_client():
+    global nba_client
+    if nba_client is not None:
+        return nba_client
+    if not BALLDONTLIE_KEYS:
+        return None
+    nba_client = RotatingClient(BALLDONTLIE_KEYS, header_name="Authorization", bearer=True)
+    return nba_client
+
 
 # Tennis uses query-param auth (not header) — handled manually in fetcher
-FOOTBALL_API_KEY = FOOTBALL_KEYS[0]
+FOOTBALL_API_KEY = FOOTBALL_KEYS[0] if FOOTBALL_KEYS else ""
 
 # ─── FOOTBALL LEAGUES ─────────────────────────────────────────────────────────
 FOOTBALL_LEAGUES = {
@@ -134,13 +167,18 @@ BOOKMAKER_ID        = 6
 
 
 # ─── VALIDATION ───────────────────────────────────────────────────────────────
-def validate_config():
+def validate_config(sport: str | None = None):
     errors = []
-    if not FOOTBALL_KEYS:
+    s = (sport or "all").strip().lower()
+    req_football = s in ("all", "football")
+    req_nba = s in ("all", "nba")
+    req_tennis = s in ("all", "tennis")
+
+    if req_football and not FOOTBALL_KEYS:
         errors.append("  ❌ FOOTBALL_API_KEYS is missing")
-    if not BALLDONTLIE_KEYS:
+    if req_nba and not BALLDONTLIE_KEYS:
         errors.append("  ❌ BALLDONTLIE_KEYS is missing")
-    if not TENNIS_KEYS:
+    if req_tennis and not TENNIS_KEYS:
         errors.append("  ❌ TENNIS_API_KEYS is missing")
     if not TELEGRAM_BOT_TOKEN:
         errors.append("  ❌ TELEGRAM_BOT_TOKEN is missing")
@@ -416,71 +454,76 @@ def fetch_football_fixtures():
     seen_ids = set()
     today = wat_today.strftime("%Y-%m-%d")
 
-    for league_id, (name, offset) in FOOTBALL_LEAGUES.items():
-        season  = datetime.now().year + offset
-        found   = False
+    fc = _get_football_client()
+    if fc:
+        for league_id, (name, offset) in FOOTBALL_LEAGUES.items():
+            season  = datetime.now().year + offset
+            found   = False
 
-        # Try current season, then fallback to previous if the key doesn't allow the current season
-        for try_season in [season, season - 1]:
-            results = []
-            covered = True
+            # Try current season, then fallback to previous if the key doesn't allow the current season
+            for try_season in [season, season - 1]:
+                results = []
+                covered = True
 
-            for utc_day in utc_dates:
-                resp = football_client.get(f"{FOOTBALL_URL}/fixtures", params={
-                    "league": league_id, "season": try_season, "date": utc_day
-                })
-                if not resp or resp.status_code != 200:
-                    continue
-
-                body = resp.json()
-                if body.get("errors"):
-                    # If the free plan doesn't cover the season, try the previous season instead.
-                    if any("Free plans" in str(e) or "do not have access" in str(e) for e in body.get("errors", [])):
-                        covered = False
-                        break
-                    continue
-
-                results.extend(body.get("response", []) or [])
-
-            if not covered:
-                continue
-
-            if results:
-                for f in results:
-                    fid = f["fixture"]["id"]
-                    if fid in seen_ids:
+                for utc_day in utc_dates:
+                    resp = fc.get(f"{FOOTBALL_URL}/fixtures", params={
+                        "league": league_id, "season": try_season, "date": utc_day
+                    })
+                    if not resp or resp.status_code != 200:
                         continue
 
-                    kickoff = f["fixture"]["date"]
-                    try:
-                        dt = datetime.fromisoformat(str(kickoff).replace("Z", "+00:00")).astimezone(WAT_OFFSET)
-                        if dt.date() != wat_today:
+                    body = resp.json()
+                    if body.get("errors"):
+                        # If the free plan doesn't cover the season, try the previous season instead.
+                        if any("Free plans" in str(e) or "do not have access" in str(e) for e in body.get("errors", [])):
+                            covered = False
+                            break
+                        continue
+
+                    results.extend(body.get("response", []) or [])
+
+                if not covered:
+                    continue
+
+                if results:
+                    for f in results:
+                        fid = f["fixture"]["id"]
+                        if fid in seen_ids:
                             continue
-                    except Exception:
-                        pass
 
-                    fixtures.append({
-                        "sport":      "football",
-                        "source":     "api-football",
-                        "fixture_id": fid,
-                        "league":     name,
-                        "league_id":  league_id,
-                        "home_team":  f["teams"]["home"]["name"],
-                        "away_team":  f["teams"]["away"]["name"],
-                        "home_id":    f["teams"]["home"]["id"],
-                        "away_id":    f["teams"]["away"]["id"],
-                        "kickoff":    kickoff,
-                        "venue":      (f["fixture"].get("venue") or {}).get("name", "TBC"),
-                    })
-                    seen_ids.add(fid)
-                found = True
-                break  # Got results — no need to try previous season
+                        kickoff = f["fixture"]["date"]
+                        try:
+                            dt = datetime.fromisoformat(str(kickoff).replace("Z", "+00:00")).astimezone(WAT_OFFSET)
+                            if dt.date() != wat_today:
+                                continue
+                        except Exception:
+                            pass
 
-        if not found:
-            print(f"[INFO] Football {name}: 0 fixtures today.")
+                        fixtures.append({
+                            "sport":      "football",
+                            "source":     "api-football",
+                            "fixture_id": fid,
+                            "league":     name,
+                            "league_id":  league_id,
+                            "home_team":  f["teams"]["home"]["name"],
+                            "away_team":  f["teams"]["away"]["name"],
+                            "home_id":    f["teams"]["home"]["id"],
+                            "away_id":    f["teams"]["away"]["id"],
+                            "kickoff":    kickoff,
+                            "venue":      (f["fixture"].get("venue") or {}).get("name", "TBC"),
+                        })
+                        seen_ids.add(fid)
+                    found = True
+                    break  # Got results — no need to try previous season
+
+            if not found:
+                print(f"[INFO] Football {name}: 0 fixtures today.")
+    else:
+        print("[WARN] FOOTBALL_API_KEYS missing — skipping API-Football fixtures.")
 
     # Fallback to football-data.org if no fixtures from api-football and client available
-    if not fixtures and football_data_client:
+    fdc = _get_football_data_client()
+    if not fixtures and fdc:
         if not _tcp_connectable("api.football-data.org", 443, timeout=1.5):
             print("[WARN] football-data.org unreachable (TCP 443). Skipping football-data fallback.")
         else:
@@ -489,7 +532,7 @@ def fetch_football_fixtures():
                 if league_id not in FOOTBALL_DATA_LEAGUES:
                     continue  # Skip leagues not available in football-data.org
                 code = FOOTBALL_DATA_LEAGUES[league_id]
-                resp = football_data_client.get(f"{FOOTBALL_DATA_URL}/competitions/{code}/matches", params={
+                resp = fdc.get(f"{FOOTBALL_DATA_URL}/competitions/{code}/matches", params={
                     "dateFrom": date_from, "dateTo": date_to
                 })
                 if not resp or resp.status_code != 200:
@@ -543,22 +586,25 @@ def fetch_football_team_stats(team_id, league_id):
     if isinstance(league_id, str):
         return fetch_football_team_stats_espn(team_id, league_id)
 
+    fc = _get_football_client()
     # Try current season -1, then -2 if free plan doesn't cover
-    for offset in [1, 2]:
-        season = datetime.now().year - offset
-        resp   = football_client.get(f"{FOOTBALL_URL}/teams/statistics", params={
-            "team": team_id, "league": league_id, "season": season
-        })
-        if resp and resp.status_code == 200:
-            body = resp.json()
-            if not body.get("errors"):
-                return body.get("response", {})
-            if any("Free plans" in str(e) for e in body.get("errors", [])):
-                continue
-        # No print for failures, fallback will handle
+    if fc:
+        for offset in [1, 2]:
+            season = datetime.now().year - offset
+            resp   = fc.get(f"{FOOTBALL_URL}/teams/statistics", params={
+                "team": team_id, "league": league_id, "season": season
+            })
+            if resp and resp.status_code == 200:
+                body = resp.json()
+                if not body.get("errors"):
+                    return body.get("response", {})
+                if any("Free plans" in str(e) for e in body.get("errors", [])):
+                    continue
+            # No print for failures, fallback will handle
     
     # Fallback to football-data.org if available and league supported
-    if football_data_client and league_id in FOOTBALL_DATA_LEAGUES:
+    fdc = _get_football_data_client()
+    if fdc and league_id in FOOTBALL_DATA_LEAGUES:
         code = FOOTBALL_DATA_LEAGUES[league_id]
         return fetch_football_team_stats_fd(team_id, code)
     
@@ -566,8 +612,11 @@ def fetch_football_team_stats(team_id, league_id):
 
 
 def fetch_football_team_stats_fd(team_id, code):
+    fdc = _get_football_data_client()
+    if not fdc:
+        return {}
     # Fetch standings for the league
-    resp = football_data_client.get(f"{FOOTBALL_DATA_URL}/competitions/{code}/standings")
+    resp = fdc.get(f"{FOOTBALL_DATA_URL}/competitions/{code}/standings")
     if not resp or resp.status_code != 200:
         return {}
     
@@ -594,7 +643,7 @@ def fetch_football_team_stats_fd(team_id, code):
     # Fetch last finished matches for form.
     # Without `status=FINISHED`, the API often returns scheduled games (no score),
     # which leads to an empty form string and `N/A` in the card output.
-    resp2 = football_data_client.get(
+    resp2 = fdc.get(
         f"{FOOTBALL_DATA_URL}/teams/{team_id}/matches",
         params={"competitions": code, "status": "FINISHED", "limit": 10},
     )
@@ -683,14 +732,20 @@ def fetch_football_team_stats_fd(team_id, code):
 
 
 def fetch_h2h(home_id, away_id):
-    resp = football_client.get(f"{FOOTBALL_URL}/fixtures/headtohead", params={
+    fc = _get_football_client()
+    if not fc:
+        return []
+    resp = fc.get(f"{FOOTBALL_URL}/fixtures/headtohead", params={
         "h2h": f"{home_id}-{away_id}", "last": 5
     })
     return resp.json().get("response", []) if resp and resp.status_code == 200 else []
 
 
 def fetch_football_odds(fixture_id):
-    resp = football_client.get(f"{FOOTBALL_URL}/odds", params={
+    fc = _get_football_client()
+    if not fc:
+        return None
+    resp = fc.get(f"{FOOTBALL_URL}/odds", params={
         "fixture": fixture_id, "bookmaker": BOOKMAKER_ID, "bet": 1
     })
     if not resp or resp.status_code != 200:
@@ -940,14 +995,18 @@ def _load_bdl_team_abbrev_map():
     if _nba_bdl_id_map:
         return
     try:
-        resp = nba_client.get(f"{BALLDONTLIE_URL}/teams", params={"per_page": 100})
-        if resp and resp.status_code == 200:
-            for t in resp.json().get("data", []):
-                tid   = t.get("id")
-                abbr  = t.get("abbreviation", "")
-                if tid and abbr:
-                    _nba_bdl_id_map[tid] = abbr
-            print(f"[INFO] BDL team map loaded from API: {len(_nba_bdl_id_map)} teams.")
+        nc = _get_nba_client()
+        if nc:
+            resp = nc.get(f"{BALLDONTLIE_URL}/teams", params={"per_page": 100})
+            if resp and resp.status_code == 200:
+                for t in resp.json().get("data", []):
+                    tid   = t.get("id")
+                    abbr  = t.get("abbreviation", "")
+                    if tid and abbr:
+                        _nba_bdl_id_map[tid] = abbr
+                print(f"[INFO] BDL team map loaded from API: {len(_nba_bdl_id_map)} teams.")
+        else:
+            print("[WARN] BALLDONTLIE_KEYS missing — using hardcoded NBA team map.")
     except Exception as e:
         print(f"[WARN] BDL team map API failed: {e}")
 
@@ -1028,6 +1087,11 @@ def fetch_nba_fixtures():
     """
     from datetime import timedelta as _td
 
+    nc = _get_nba_client()
+    if not nc:
+        print("[WARN] BALLDONTLIE_KEYS missing — cannot load NBA fixtures.")
+        return []
+
     now_utc  = datetime.now(timezone.utc)
     now_wat  = now_utc.astimezone(WAT_OFFSET)
 
@@ -1048,7 +1112,7 @@ def fetch_nba_fixtures():
     all_games = []
     for date_str in sorted(utc_dates):
         try:
-            resp = nba_client.get(
+            resp = nc.get(
                 f"{BALLDONTLIE_URL}/games",
                 params={"dates[]": date_str, "per_page": 50},
             )

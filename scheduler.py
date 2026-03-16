@@ -44,7 +44,7 @@ def run_football():
     from predictor import FootballPredictor
     from telegram_sender import TelegramSender
 
-    validate_config()
+    validate_config("football")
     sender   = TelegramSender(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
     f_pred   = FootballPredictor()
     now_wat  = datetime.now(WAT_OFFSET)
@@ -105,7 +105,7 @@ def run_nba():
     from basketball_predictor import BasketballPredictor
     from telegram_sender import TelegramSender
 
-    validate_config()
+    validate_config("nba")
     sender   = TelegramSender(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
     b_pred   = BasketballPredictor()
     date_str = datetime.now(WAT_OFFSET).strftime("%A, %d %B %Y")
@@ -147,7 +147,7 @@ def run_tennis():
     from tennis_predictor import TennisPredictor
     from telegram_sender import TelegramSender
 
-    validate_config()
+    validate_config("tennis")
     sender   = TelegramSender(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
     t_pred   = TennisPredictor()
     date_str = datetime.now(WAT_OFFSET).strftime("%A, %d %B %Y")
