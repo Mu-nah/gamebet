@@ -60,7 +60,7 @@ def run_football():
         hs   = fetch_football_team_stats(fix["home_id"], fix["league_id"])
         aws  = fetch_football_team_stats(fix["away_id"], fix["league_id"])
         source = fix.get("source", "api-football")
-        if source == "football-data":
+        if source != "api-football":
             h2h = []
             odds = None
         else:

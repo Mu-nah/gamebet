@@ -5,6 +5,7 @@ Sports: Football | NBA Basketball | Tennis
 
 import os
 import sys
+import socket
 import requests
 from datetime import datetime, timezone, timedelta, time as dt_time
 
@@ -96,6 +97,22 @@ FOOTBALL_DATA_LEAGUES = {
     # Note: Serie B, 2. Bundesliga, Conference League not available in football-data.org free tier
 }
 
+# Mapping from api-football league IDs to ESPN soccer league keys (free, no key).
+# Used as a last-resort fallback when api-football has no fixtures and football-data.org is unreachable.
+FOOTBALL_ESPN_LEAGUES = {
+    39:  "eng.1",             # Premier League
+    140: "esp.1",             # La Liga
+    141: "esp.2",             # La Liga 2
+    135: "ita.1",             # Serie A
+    136: "ita.2",             # Serie B
+    78:  "ger.1",             # Bundesliga
+    79:  "ger.2",             # 2. Bundesliga
+    61:  "fra.1",             # Ligue 1
+    2:   "uefa.champions",    # UCL
+    3:   "uefa.europa",       # Europa League
+    848: "uefa.europa.conf",  # Conference League
+}
+
 MIN_MATCHES_PLAYED  = 10
 VALUE_BET_THRESHOLD = 0.12
 BOOKMAKER_ID        = 6
@@ -128,6 +145,152 @@ def validate_config():
 # ═══════════════════════════════════════════════════════════════════════════════
 # FOOTBALL FETCHERS
 # ═══════════════════════════════════════════════════════════════════════════════
+ESPN_SOCCER_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer"
+_espn_soccer_standings_cache = {}  # {league_key: {team_id: stats_dict}}
+
+
+def _tcp_connectable(host: str, port: int, timeout: float = 1.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _ensure_espn_soccer_standings_loaded(league_key: str):
+    if league_key in _espn_soccer_standings_cache:
+        return
+
+    url = f"{ESPN_SOCCER_URL}/{league_key}/standings"
+    try:
+        resp = requests.get(url, headers=ESPN_HEADERS, timeout=10)
+        if resp.status_code != 200:
+            _espn_soccer_standings_cache[league_key] = {}
+            return
+        data = resp.json() or {}
+    except Exception:
+        _espn_soccer_standings_cache[league_key] = {}
+        return
+
+    entries = []
+    try:
+        if (data.get("standings") or {}).get("entries"):
+            entries.extend(data["standings"]["entries"])
+        for c in data.get("children", []) or []:
+            st = (c.get("standings") or {})
+            if st.get("entries"):
+                entries.extend(st["entries"])
+    except Exception:
+        entries = entries or []
+
+    team_map = {}
+    for e in entries:
+        team = e.get("team", {}) or {}
+        tid = team.get("id")
+        if not tid:
+            continue
+
+        stats_map = {}
+        for s in e.get("stats", []) or []:
+            name = s.get("name")
+            if not name:
+                continue
+            val = s.get("value")
+            if val is None:
+                dv = s.get("displayValue")
+                try:
+                    val = float(str(dv).strip())
+                except Exception:
+                    val = None
+            stats_map[name] = val
+
+        played = int(stats_map.get("gamesPlayed") or stats_map.get("games") or 0)
+        points = float(stats_map.get("points") or 0)
+        gf = float(stats_map.get("goalsFor") or 0)
+        ga = float(stats_map.get("goalsAgainst") or 0)
+        if played <= 0:
+            continue
+
+        avg_for = gf / played
+        avg_against = ga / played
+        team_map[str(tid)] = {
+            "fixtures": {"played": {"total": played}},
+            "goals": {
+                "for": {"average": {"home": avg_for, "away": avg_for, "total": avg_for}},
+                "against": {"average": {"home": avg_against, "away": avg_against, "total": avg_against}},
+            },
+            "form": "",
+            "fd_ppg": points / played,
+            "fd_gd_per_game": (gf - ga) / played,
+        }
+
+    _espn_soccer_standings_cache[league_key] = team_map
+
+
+def fetch_football_team_stats_espn(team_id, league_key: str):
+    _ensure_espn_soccer_standings_loaded(league_key)
+    return _espn_soccer_standings_cache.get(league_key, {}).get(str(team_id), {})
+
+
+def fetch_football_fixtures_espn(wat_today):
+    ymd = wat_today.strftime("%Y%m%d")
+    fixtures = []
+    seen = set()
+
+    for league_id, (name, _) in FOOTBALL_LEAGUES.items():
+        league_key = FOOTBALL_ESPN_LEAGUES.get(league_id)
+        if not league_key:
+            continue
+
+        url = f"{ESPN_SOCCER_URL}/{league_key}/scoreboard"
+        try:
+            resp = requests.get(url, headers=ESPN_HEADERS, params={"dates": ymd}, timeout=10)
+        except Exception:
+            continue
+        if resp.status_code != 200:
+            continue
+
+        try:
+            events = resp.json().get("events", []) or []
+        except Exception:
+            continue
+
+        for ev in events:
+            eid = ev.get("id")
+            if not eid:
+                continue
+            fid = f"espn_{eid}"
+            if fid in seen:
+                continue
+            comps = ev.get("competitions") or []
+            comp = comps[0] if comps else {}
+            competitors = comp.get("competitors") or []
+            home = next((c for c in competitors if c.get("homeAway") == "home"), None)
+            away = next((c for c in competitors if c.get("homeAway") == "away"), None)
+            if not home or not away:
+                continue
+
+            kickoff = ev.get("date") or comp.get("date")
+            venue = ((comp.get("venue") or {}).get("fullName")) or "TBC"
+
+            fixtures.append({
+                "sport": "football",
+                "source": "espn",
+                "fixture_id": fid,
+                "league": name,
+                "league_id": league_key,
+                "home_team": ((home.get("team") or {}).get("displayName")) or "Home",
+                "away_team": ((away.get("team") or {}).get("displayName")) or "Away",
+                "home_id": (home.get("team") or {}).get("id"),
+                "away_id": (away.get("team") or {}).get("id"),
+                "kickoff": kickoff,
+                "venue": venue,
+            })
+            seen.add(fid)
+
+    return fixtures
+
+
 def fetch_football_fixtures():
     # We report fixtures in WAT, but api-football's `date=YYYY-MM-DD` is UTC-based.
     # Around midnight WAT, using only "today UTC" can pull the wrong matchday.
@@ -148,20 +311,29 @@ def fetch_football_fixtures():
 
         # Try current season, then fallback to previous if the key doesn't allow the current season
         for try_season in [season, season - 1]:
-            resp = football_client.get(f"{FOOTBALL_URL}/fixtures", params={
-                "league": league_id, "season": try_season, "date": today
-            })
-            if not resp or resp.status_code != 200:
+            results = []
+            covered = True
+
+            for utc_day in utc_dates:
+                resp = football_client.get(f"{FOOTBALL_URL}/fixtures", params={
+                    "league": league_id, "season": try_season, "date": utc_day
+                })
+                if not resp or resp.status_code != 200:
+                    continue
+
+                body = resp.json()
+                if body.get("errors"):
+                    # If the free plan doesn't cover the season, try the previous season instead.
+                    if any("Free plans" in str(e) or "do not have access" in str(e) for e in body.get("errors", [])):
+                        covered = False
+                        break
+                    continue
+
+                results.extend(body.get("response", []) or [])
+
+            if not covered:
                 continue
 
-            body = resp.json()
-            if body.get("errors"):
-                # If the free plan doesn't cover the season, try the previous season instead.
-                if any("Free plans" in str(e) or "do not have access" in str(e) for e in body.get("errors", [])):
-                    continue  # Try next season in the loop
-                continue
-
-            results = body.get("response", [])
             if results:
                 for f in results:
                     fid = f["fixture"]["id"]
@@ -198,42 +370,52 @@ def fetch_football_fixtures():
 
     # Fallback to football-data.org if no fixtures from api-football and client available
     if not fixtures and football_data_client:
-        print("[INFO] Trying football-data.org as alternative source...")
-        for league_id, (name, offset) in FOOTBALL_LEAGUES.items():
-            if league_id not in FOOTBALL_DATA_LEAGUES:
-                continue  # Skip leagues not available in football-data.org
-            code = FOOTBALL_DATA_LEAGUES[league_id]
-            resp = football_data_client.get(f"{FOOTBALL_DATA_URL}/competitions/{code}/matches", params={
-                "dateFrom": date_from, "dateTo": date_to
-            })
-            if not resp or resp.status_code != 200:
-                continue
-            body = resp.json()
-            matches = body.get("matches", [])
-            if matches:
-                for m in matches:
-                    kickoff = m["utcDate"]
-                    try:
-                        dt = datetime.fromisoformat(str(kickoff).replace("Z", "+00:00")).astimezone(WAT_OFFSET)
-                        if dt.date() != wat_today:
-                            continue
-                    except Exception:
-                        pass
+        if not _tcp_connectable("api.football-data.org", 443, timeout=1.5):
+            print("[WARN] football-data.org unreachable (TCP 443). Skipping football-data fallback.")
+        else:
+            print("[INFO] Trying football-data.org as alternative source...")
+            for league_id, (name, offset) in FOOTBALL_LEAGUES.items():
+                if league_id not in FOOTBALL_DATA_LEAGUES:
+                    continue  # Skip leagues not available in football-data.org
+                code = FOOTBALL_DATA_LEAGUES[league_id]
+                resp = football_data_client.get(f"{FOOTBALL_DATA_URL}/competitions/{code}/matches", params={
+                    "dateFrom": date_from, "dateTo": date_to
+                })
+                if not resp or resp.status_code != 200:
+                    continue
+                body = resp.json()
+                matches = body.get("matches", [])
+                if matches:
+                    for m in matches:
+                        kickoff = m["utcDate"]
+                        try:
+                            dt = datetime.fromisoformat(str(kickoff).replace("Z", "+00:00")).astimezone(WAT_OFFSET)
+                            if dt.date() != wat_today:
+                                continue
+                        except Exception:
+                            pass
 
-                    fixtures.append({
-                        "sport":      "football",
-                        "source":     "football-data",
-                        "fixture_id": f"fd_{m['id']}",  # prefix to distinguish
-                        "league":     name,
-                        "league_id":  league_id,
-                        "home_team":  m["homeTeam"]["name"],
-                        "away_team":  m["awayTeam"]["name"],
-                        "home_id":    m["homeTeam"]["id"],
-                        "away_id":    m["awayTeam"]["id"],
-                        "kickoff":    kickoff,
-                        "venue":      "TBC",  # football-data.org doesn't provide venue in matches
-                    })
-                print(f"[INFO] Football-data.org {name}: {len(matches)} fixtures.")
+                        fixtures.append({
+                            "sport":      "football",
+                            "source":     "football-data",
+                            "fixture_id": f"fd_{m['id']}",  # prefix to distinguish
+                            "league":     name,
+                            "league_id":  league_id,
+                            "home_team":  m["homeTeam"]["name"],
+                            "away_team":  m["awayTeam"]["name"],
+                            "home_id":    m["homeTeam"]["id"],
+                            "away_id":    m["awayTeam"]["id"],
+                            "kickoff":    kickoff,
+                            "venue":      "TBC",  # football-data.org doesn't provide venue in matches
+                        })
+                    print(f"[INFO] Football-data.org {name}: {len(matches)} fixtures.")
+
+    # Fallback to ESPN soccer if still empty (no key required).
+    if not fixtures:
+        espn_fixtures = fetch_football_fixtures_espn(wat_today)
+        if espn_fixtures:
+            fixtures.extend(espn_fixtures)
+            print(f"[INFO] ESPN soccer: {len(espn_fixtures)} fixtures.")
 
     if not fixtures:
         print(
@@ -247,6 +429,9 @@ def fetch_football_fixtures():
 
 
 def fetch_football_team_stats(team_id, league_id):
+    if isinstance(league_id, str):
+        return fetch_football_team_stats_espn(team_id, league_id)
+
     # Try current season -1, then -2 if free plan doesn't cover
     for offset in [1, 2]:
         season = datetime.now().year - offset
@@ -1361,7 +1546,7 @@ def run_predictions():
     for fix in football_fixtures:
         hs   = fetch_football_team_stats(fix["home_id"], fix["league_id"])
         aws  = fetch_football_team_stats(fix["away_id"], fix["league_id"])
-        if fix.get("source") == "football-data":
+        if fix.get("source") != "api-football":
             h2h = []
             odds = None
         else:
