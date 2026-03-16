@@ -18,6 +18,12 @@ import time
 from datetime import datetime, timezone, timedelta
 from news_analyzer import get_team_sentiment
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 WAT_OFFSET = timezone(timedelta(hours=1))
 
 

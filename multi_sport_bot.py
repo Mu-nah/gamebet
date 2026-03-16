@@ -10,6 +10,12 @@ import requests
 from datetime import datetime, timezone, timedelta, time as dt_time
 
 try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
@@ -24,6 +30,15 @@ from api_client           import RotatingClient
 
 # WAT = UTC+1
 WAT_OFFSET = timezone(timedelta(hours=1))
+
+# One shared session for non-keyed endpoints (ESPN, tennis, etc.).
+# Default: ignore HTTP(S)_PROXY env vars because they are often misconfigured on Windows.
+_http = requests.Session()
+try:
+    v = os.getenv("REQUESTS_TRUST_ENV", "").strip().lower()
+    _http.trust_env = True if v in ("1", "true", "yes") else False
+except Exception:
+    _http.trust_env = False
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -136,7 +151,7 @@ def validate_config():
         for e in errors:
             print(e)
         sys.exit(1)
-    print(f"[INFO] Config loaded ✅  "
+    print(f"[INFO] Config loaded OK  "
           f"({len(FOOTBALL_KEYS)} football key(s), "
           f"{len(BALLDONTLIE_KEYS)} NBA key(s), "
           f"{len(TENNIS_KEYS)} tennis key(s))")
@@ -146,7 +161,9 @@ def validate_config():
 # FOOTBALL FETCHERS
 # ═══════════════════════════════════════════════════════════════════════════════
 ESPN_SOCCER_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer"
-_espn_soccer_standings_cache = {}  # {league_key: {team_id: stats_dict}}
+# Cache ESPN soccer *team* stats, pulled from the per-team endpoint.
+# ESPN's `/standings` endpoint sometimes returns `{}` in some networks, so we avoid relying on it.
+_espn_soccer_team_cache = {}  # {league_key: {team_id: stats_dict}}
 
 
 def _tcp_connectable(host: str, port: int, timeout: float = 1.5) -> bool:
@@ -157,79 +174,102 @@ def _tcp_connectable(host: str, port: int, timeout: float = 1.5) -> bool:
         return False
 
 
-def _ensure_espn_soccer_standings_loaded(league_key: str):
-    if league_key in _espn_soccer_standings_cache:
-        return
+def _espn_soccer_team_stats_from_record(record: dict) -> dict:
+    """
+    Convert ESPN soccer team `record.items[*].stats` into a structure compatible
+    with our FootballPredictor expectations (api-football-like).
+    """
+    if not isinstance(record, dict):
+        return {}
+    items = record.get("items") or []
+    if not items:
+        return {}
 
-    url = f"{ESPN_SOCCER_URL}/{league_key}/standings"
-    try:
-        resp = requests.get(url, headers=ESPN_HEADERS, timeout=10)
-        if resp.status_code != 200:
-            _espn_soccer_standings_cache[league_key] = {}
-            return
-        data = resp.json() or {}
-    except Exception:
-        _espn_soccer_standings_cache[league_key] = {}
-        return
-
-    entries = []
-    try:
-        if (data.get("standings") or {}).get("entries"):
-            entries.extend(data["standings"]["entries"])
-        for c in data.get("children", []) or []:
-            st = (c.get("standings") or {})
-            if st.get("entries"):
-                entries.extend(st["entries"])
-    except Exception:
-        entries = entries or []
-
-    team_map = {}
-    for e in entries:
-        team = e.get("team", {}) or {}
-        tid = team.get("id")
-        if not tid:
+    # Prefer the "total" record if present; otherwise take the first item.
+    item = next((it for it in items if (it or {}).get("type") == "total"), None) or items[0] or {}
+    stats_map = {}
+    for s in item.get("stats") or []:
+        name = (s or {}).get("name")
+        if not name:
             continue
+        val = (s or {}).get("value")
+        try:
+            stats_map[name] = float(val) if val is not None else None
+        except Exception:
+            stats_map[name] = None
 
-        stats_map = {}
-        for s in e.get("stats", []) or []:
-            name = s.get("name")
-            if not name:
-                continue
-            val = s.get("value")
-            if val is None:
-                dv = s.get("displayValue")
-                try:
-                    val = float(str(dv).strip())
-                except Exception:
-                    val = None
-            stats_map[name] = val
+    def _f(name: str, default: float = 0.0) -> float:
+        try:
+            v = stats_map.get(name)
+            return float(v) if v is not None else default
+        except Exception:
+            return default
 
-        played = int(stats_map.get("gamesPlayed") or stats_map.get("games") or 0)
-        points = float(stats_map.get("points") or 0)
-        gf = float(stats_map.get("goalsFor") or 0)
-        ga = float(stats_map.get("goalsAgainst") or 0)
-        if played <= 0:
-            continue
+    played = int(_f("gamesPlayed", 0))
+    if played <= 0:
+        return {}
 
-        avg_for = gf / played
-        avg_against = ga / played
-        team_map[str(tid)] = {
-            "fixtures": {"played": {"total": played}},
-            "goals": {
-                "for": {"average": {"home": avg_for, "away": avg_for, "total": avg_for}},
-                "against": {"average": {"home": avg_against, "away": avg_against, "total": avg_against}},
-            },
-            "form": "",
-            "fd_ppg": points / played,
-            "fd_gd_per_game": (gf - ga) / played,
-        }
+    # ESPN uses pointsFor/pointsAgainst for soccer (goals for/against).
+    gf_total = _f("pointsFor", 0.0)
+    ga_total = _f("pointsAgainst", 0.0)
+    pts_total = _f("points", 0.0)
 
-    _espn_soccer_standings_cache[league_key] = team_map
+    home_gp = max(int(_f("homeGamesPlayed", 0)), 0)
+    away_gp = max(int(_f("awayGamesPlayed", 0)), 0)
+    home_gf = _f("homePointsFor", 0.0)
+    home_ga = _f("homePointsAgainst", 0.0)
+    away_gf = _f("awayPointsFor", 0.0)
+    away_ga = _f("awayPointsAgainst", 0.0)
+
+    avg_for_total = gf_total / played
+    avg_against_total = ga_total / played
+
+    # If splits are missing, fall back to total averages.
+    avg_for_home = (home_gf / home_gp) if home_gp > 0 else avg_for_total
+    avg_against_home = (home_ga / home_gp) if home_gp > 0 else avg_against_total
+    avg_for_away = (away_gf / away_gp) if away_gp > 0 else avg_for_total
+    avg_against_away = (away_ga / away_gp) if away_gp > 0 else avg_against_total
+
+    return {
+        "fixtures": {"played": {"total": played}},
+        "goals": {
+            "for": {"average": {"home": avg_for_home, "away": avg_for_away, "total": avg_for_total}},
+            "against": {"average": {"home": avg_against_home, "away": avg_against_away, "total": avg_against_total}},
+        },
+        # ESPN team endpoint doesn't provide a simple last-5 form string.
+        "form": "",
+        # Extra signal used by our predictor (originally added for football-data.org fallback).
+        "fd_ppg": (pts_total / played) if played > 0 else 0.0,
+        "fd_gd_per_game": ((gf_total - ga_total) / played) if played > 0 else 0.0,
+    }
 
 
 def fetch_football_team_stats_espn(team_id, league_key: str):
-    _ensure_espn_soccer_standings_loaded(league_key)
-    return _espn_soccer_standings_cache.get(league_key, {}).get(str(team_id), {})
+    """
+    ESPN fallback: per-team endpoint has reliable record/goals data even when `/standings` is empty.
+    """
+    if not team_id or not league_key:
+        return {}
+
+    league_cache = _espn_soccer_team_cache.setdefault(str(league_key), {})
+    tid = str(team_id)
+    if tid in league_cache:
+        return league_cache.get(tid, {}) or {}
+
+    url = f"{ESPN_SOCCER_URL}/{league_key}/teams/{tid}"
+    try:
+        resp = _http.get(url, headers=ESPN_HEADERS, timeout=10)
+        if resp.status_code != 200:
+            return {}
+        data = resp.json() or {}
+        team = (data.get("team") or {})
+        record = (team.get("record") or {})
+        stats = _espn_soccer_team_stats_from_record(record)
+        if stats:
+            league_cache[tid] = stats
+        return stats or {}
+    except Exception:
+        return {}
 
 
 def fetch_football_fixtures_espn(wat_today):
@@ -244,7 +284,7 @@ def fetch_football_fixtures_espn(wat_today):
 
         url = f"{ESPN_SOCCER_URL}/{league_key}/scoreboard"
         try:
-            resp = requests.get(url, headers=ESPN_HEADERS, params={"dates": ymd}, timeout=10)
+            resp = _http.get(url, headers=ESPN_HEADERS, params={"dates": ymd}, timeout=10)
         except Exception:
             continue
         if resp.status_code != 200:
@@ -685,7 +725,7 @@ def _load_nba_stats_from_espn():
     try:
         print("[INFO] Fetching NBA stats from ESPN (team details)...")
 
-        resp = requests.get(
+        resp = _http.get(
             "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams",
             headers=ESPN_HEADERS,
             params={"limit": 32},
@@ -716,7 +756,7 @@ def _load_nba_stats_from_espn():
         # Fetch each team's detail page to extract record stats
         for abbrev, espn_id in abbrev_to_id.items():
             try:
-                resp = requests.get(
+                resp = _http.get(
                     f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{espn_id}",
                     headers=ESPN_HEADERS,
                     timeout=10,
@@ -776,7 +816,7 @@ def _load_nba_stats_from_espn_scoreboard():
     if _nba_stats_cache:
         return
     try:
-        resp = requests.get(
+        resp = _http.get(
             "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
             headers=ESPN_HEADERS, timeout=10
         )
@@ -1106,7 +1146,7 @@ def fetch_tennis_player_stats(player_key, surface="hard", player_name=""):
     if player_key:
         for key in TENNIS_KEYS:
             try:
-                r = requests.get(API_TENNIS_URL, params={
+                r = _http.get(API_TENNIS_URL, params={
                     "method": "get_players", "player_key": player_key, "APIkey": key
                 }, timeout=8)
                 if r.status_code == 200:
@@ -1174,7 +1214,7 @@ def _call_tennis_api(params):
     """Helper — tries all TENNIS_KEYS, returns parsed result list or []."""
     for key in TENNIS_KEYS:
         try:
-            r = requests.get(API_TENNIS_URL, params={**params, "APIkey": key}, timeout=10)
+            r = _http.get(API_TENNIS_URL, params={**params, "APIkey": key}, timeout=10)
             if r.status_code == 200:
                 body = r.json()
                 if body.get("success") == 1:
@@ -1288,7 +1328,9 @@ def format_football_card(fix, pred):
     w_e      = {"home": "🏠", "draw": "🤝", "away": "✈️"}.get(pred["winner"], "❓")
     btts_e   = "✅" if pred["btts"] == "Yes" else "❌"
     ou_e     = "⬆️" if pred["over_under"] == "Over 2.5" else "⬇️"
-    conf_bar = "█" * (pred["confidence"] // 10) + "░" * (10 - pred["confidence"] // 10)
+    conf = int(round(float(pred.get("confidence", 0) or 0)))
+    conf = max(0, min(conf, 100))
+    conf_bar = "█" * (conf // 10) + "░" * (10 - conf // 10)
 
     vb_block = ""
     if pred.get("value_bets"):
@@ -1298,13 +1340,14 @@ def format_football_card(fix, pred):
         vb_block = "\n".join(lines)
 
     note_line = f"\n⚠️ _{pred['data_note']}_" if pred.get("data_note") else ""
+    venue = fix.get("venue", "TBC")
 
     return f"""
 ⚽ *FOOTBALL — {fix['league']}*
 🆚 *{fix['home_team']}* vs *{fix['away_team']}*
-⏰ `{ko_str(fix['kickoff'])}` 📍 _{fix.get('venue', 'TBC')}_{note_line}_
+⏰ `{ko_str(fix['kickoff'])}` 📍 _{venue}_{note_line}
 
-🎯 {pred['grade']} | {w_e} *{pred['winner_label']}* `{pred['confidence']}%`
+🎯 {pred['grade']} | {w_e} *{pred['winner_label']}* `{conf}%`
 `[{conf_bar}]`
 🏠`{pred['prob_home']}%` 🤝`{pred['prob_draw']}%` ✈️`{pred['prob_away']}%`
 
