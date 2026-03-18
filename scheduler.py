@@ -168,8 +168,9 @@ def run_football(dedupe: bool = True):
         for fix, pred in results:
             sender.send_message(format_football_card(fix, pred), parse_mode="Markdown")
             _sent_fixture_ids.add(fix["fixture_id"])  # mark as sent
-        if dedupe:
-            _save_sent_ids("football", today, _sent_fixture_ids)
+        # Always persist what we sent today so scheduled runs don't spam,
+        # but only use this state for filtering when `dedupe=True`.
+        _save_sent_ids("football", today, _sent_fixture_ids)
     elif fixtures:
         # Send the "no HIGH picks" notice at most once per day (cron runs shouldn't spam).
         if not (dedupe and _sent_fixture_ids) and not (dedupe and _load_notice_sent("football", today)):
@@ -228,8 +229,7 @@ def run_nba(dedupe: bool = True):
             sender.send_message(format_basketball_card(fix, pred), parse_mode="Markdown")
             if fix.get("fixture_id") is not None:
                 sent_ids.add(str(fix["fixture_id"]))
-        if dedupe:
-            _save_sent_ids("nba", today, sent_ids)
+        _save_sent_ids("nba", today, sent_ids)
     else:
         # If we already sent some today and we're deduping, don't spam "no qualifying".
         if not (dedupe and sent_ids) and not (dedupe and _load_notice_sent("nba", today)):
@@ -288,8 +288,7 @@ def run_tennis(dedupe: bool = True):
             sender.send_message(format_tennis_card(fix, pred), parse_mode="Markdown")
             if fix.get("fixture_id") is not None:
                 sent_ids.add(str(fix["fixture_id"]))
-        if dedupe:
-            _save_sent_ids("tennis", today, sent_ids)
+        _save_sent_ids("tennis", today, sent_ids)
     else:
         if not (dedupe and sent_ids) and not (dedupe and _load_notice_sent("tennis", today)):
             sender.send_message("🎾 No HIGH confidence tennis predictions right now.", parse_mode="Markdown")
