@@ -14,3 +14,4 @@ __pycache__/
 *.sqlite
 
 .state/
+.hf_cache/

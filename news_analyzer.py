@@ -50,9 +50,10 @@ def _load_finbert():
     if not FINBERT_AVAILABLE:
         return False
     try:
-        import os
-        os.environ["HF_HOME"]             = "/tmp/.cache"
-        os.environ["TRANSFORMERS_CACHE"]  = "/tmp/.cache"
+        # Respect any caller-provided HuggingFace cache directories (e.g. GitHub Actions cache).
+        # If not set, default to a persistent location under the user's home.
+        os.environ.setdefault("HF_HOME", os.path.join(os.path.expanduser("~"), ".cache", "huggingface"))
+        os.environ.setdefault("TRANSFORMERS_CACHE", os.environ["HF_HOME"])
         print("[INFO] Loading FinBERT sentiment model (first run may take 30s)...")
         _tokenizer = AutoTokenizer.from_pretrained(
             "yiyanghkust/finbert-tone", use_fast=False
