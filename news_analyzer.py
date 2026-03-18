@@ -11,6 +11,7 @@ Sentiment cache: results stored per team per day to avoid repeat fetches.
 
 import re
 import time
+import os
 import requests
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
@@ -161,6 +162,14 @@ def get_team_sentiment(team_name, sport="football"):
         "available": False,
         "summary":   "Sentiment N/A",
     }
+
+    # Allow disabling sentiment (useful on CI/GitHub Actions to avoid slow model downloads).
+    try:
+        if str(os.getenv("DISABLE_SENTIMENT", "")).strip().lower() in ("1", "true", "yes"):
+            _sentiment_cache[cache_key] = result
+            return result
+    except Exception:
+        pass
 
     if not _load_finbert():
         _sentiment_cache[cache_key] = result
