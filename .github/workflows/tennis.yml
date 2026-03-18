@@ -27,9 +27,9 @@ jobs:
           key: hf-${{ runner.os }}-${{ steps.req.outputs.hash }}
           restore-keys: |
             hf-${{ runner.os }}-
-      - name: Cache Key (UTC day)
+      - name: Cache Key (WAT day)
         id: day
-        run: echo "day=$(date -u +%Y-%m-%d)" >> $GITHUB_OUTPUT
+        run: echo "day=$(TZ=Africa/Lagos date +%Y-%m-%d)" >> $GITHUB_OUTPUT
       - name: Cache Sent State
         uses: actions/cache@v4
         with:
