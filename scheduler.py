@@ -257,12 +257,16 @@ def run_tennis(dedupe: bool = True):
     now_wat = datetime.now(WAT_OFFSET)
     today = now_wat.date()
     sent_ids = _load_sent_ids("tennis", today) if dedupe else set()
+    if dedupe:
+        print(f"[INFO] Tennis dedupe ON — {len(sent_ids)} fixture(s) already sent today.")
 
     fixtures = fetch_tennis_fixtures()
     results  = []
+    skipped_already_sent = 0
     for fix in fixtures:
         fid = str(fix.get("fixture_id") or "")
         if fid and fid in sent_ids:
+            skipped_already_sent += 1
             continue
         surface    = t_pred._detect_surface(fix.get("tournament", ""))
         home_stats = fetch_tennis_player_stats(
@@ -294,6 +298,8 @@ def run_tennis(dedupe: bool = True):
             sender.send_message("🎾 No HIGH confidence tennis predictions right now.", parse_mode="Markdown")
             if dedupe:
                 _save_notice_sent("tennis", today)
+    if skipped_already_sent:
+        print(f"[INFO] Tennis: skipped {skipped_already_sent} already-sent fixture(s) today.")
     print(f"[TENNIS] {len(results)} sent (LOW confidence filtered out).")
 
 

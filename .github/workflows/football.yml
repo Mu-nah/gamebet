@@ -51,4 +51,10 @@ jobs:
           REQUESTS_TRUST_ENV: "0"
           HF_HOME: ${{ github.workspace }}/.hf_cache
           TRANSFORMERS_CACHE: ${{ github.workspace }}/.hf_cache
-        run: python scheduler.py --sport football --now
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "[INFO] Manual run: resend enabled (no dedupe)."
+            python scheduler.py --sport football --now --resend
+          else
+            python scheduler.py --sport football --now
+          fi
