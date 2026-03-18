@@ -3,6 +3,7 @@ Telegram Sender — with retry on timeout/connection error.
 """
 
 import time
+import os
 import requests
 
 
@@ -11,6 +12,13 @@ class TelegramSender:
         self.token    = token
         self.chat_id  = chat_id
         self.base_url = f"https://api.telegram.org/bot{token}"
+        # Default: ignore HTTP(S)_PROXY env vars unless explicitly enabled.
+        self._http = requests.Session()
+        try:
+            v = os.getenv("REQUESTS_TRUST_ENV", "").strip().lower()
+            self._http.trust_env = True if v in ("1", "true", "yes") else False
+        except Exception:
+            self._http.trust_env = False
 
     def send_message(self, text: str, parse_mode: str = "Markdown",
                      retries: int = 3, delay: int = 5) -> bool:
@@ -24,7 +32,7 @@ class TelegramSender:
         }
         for attempt in range(1, retries + 1):
             try:
-                resp = requests.post(url, json=payload, timeout=15)
+                resp = self._http.post(url, json=payload, timeout=15)
                 if resp.status_code == 200:
                     print("[TELEGRAM] Message sent successfully.")
                     return True
@@ -56,7 +64,7 @@ class TelegramSender:
         """Test bot token is valid."""
         for attempt in range(3):
             try:
-                resp = requests.get(f"{self.base_url}/getMe", timeout=10)
+                resp = self._http.get(f"{self.base_url}/getMe", timeout=10)
                 if resp.status_code == 200:
                     name = resp.json().get("result", {}).get("username", "?")
                     print(f"[TELEGRAM] Connected as @{name}")
