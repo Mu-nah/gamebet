@@ -4,8 +4,6 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "0 0,6,12,18 * * *"
-    # Extra late-night sweep: 02:00 UTC = 03:00 WAT.
-    - cron: "0 2 * * *"
 
 jobs:
   run:
