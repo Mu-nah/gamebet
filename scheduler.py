@@ -306,9 +306,10 @@ def run_tennis(dedupe: bool = True):
     results = filtered
 
     if results:
+        # Only send women's tennis alerts for now.
         women = [(f, p) for f, p in results if (f.get("gender") or "").lower() == "women"]
-        mixed = [(f, p) for f, p in results if (f.get("gender") or "").lower() == "mixed"]
-        men   = [(f, p) for f, p in results if (f.get("gender") or "").lower() not in ("women", "mixed")]
+        mixed = []
+        men   = []
 
         if women:
             sender.send_message(format_sport_summary("🎾", "TENNIS (WOMEN)", women, date_str), parse_mode="Markdown")
@@ -317,19 +318,6 @@ def run_tennis(dedupe: bool = True):
                 if fix.get("fixture_id") is not None:
                     sent_ids.add(str(fix["fixture_id"]))
 
-        if mixed:
-            sender.send_message(format_sport_summary("🎾", "TENNIS (MIXED)", mixed, date_str), parse_mode="Markdown")
-            for fix, pred in mixed:
-                sender.send_message(format_tennis_card(fix, pred), parse_mode="Markdown")
-                if fix.get("fixture_id") is not None:
-                    sent_ids.add(str(fix["fixture_id"]))
-
-        if men:
-            sender.send_message(format_sport_summary("🎾", "TENNIS (MEN)", men, date_str), parse_mode="Markdown")
-            for fix, pred in men:
-                sender.send_message(format_tennis_card(fix, pred), parse_mode="Markdown")
-                if fix.get("fixture_id") is not None:
-                    sent_ids.add(str(fix["fixture_id"]))
         _save_sent_ids("tennis", today, sent_ids)
     else:
         sent_any = _load_sent_ids("tennis", today)
